@@ -1,3 +1,4 @@
+import os
 from flask import Flask, request, jsonify
 from onboardmate_lib import setup_repo
 
@@ -16,4 +17,6 @@ def setup():
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    # Use Render's assigned port, default to 5000 locally
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
