@@ -3,14 +3,12 @@ from flask_cors import CORS
 from onboardmate_lib import setup_repo
 
 app = Flask(__name__)
-CORS(app)  # Enables CORS for all origins
+CORS(app)  # enable CORS for all routes
 
-# Root route – confirms service is running
 @app.route("/", methods=["GET"])
-def home():
-    return jsonify({"message": "OnboardMate backend is running!"})
+def root():
+    return "Backend is running", 200
 
-# Setup route – handles repo cloning, dependency installation, smoke test
 @app.route("/setup", methods=["POST"])
 def setup():
     data = request.get_json()
@@ -19,11 +17,9 @@ def setup():
         return jsonify({"error": "repo_url is required"}), 400
     try:
         result = setup_repo(repo_url)
-        # Add repo name for frontend display
-        result["repo_name"] = repo_url.split("/")[-1].replace(".git", "")
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    app.run(debug=True)
