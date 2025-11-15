@@ -10,27 +10,19 @@ os.makedirs(PROJECTS_DIR, exist_ok=True)
 
 app = Flask(__name__)
 
-# Enable ALL CORS INCLUDING OPTIONS
+# Global CORS
 CORS(
     app,
     resources={r"/*": {"origins": "*"}},
-    supports_credentials=True,
-    allow_headers="*",
-    methods=["GET", "POST", "OPTIONS"]
+    supports_credentials=True
 )
 
 @app.after_request
-def add_cors_headers(response):
+def add_headers(response):
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Headers"] = "*"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     return response
-
-# Common handler for OPTIONS
-@app.route('/setup', methods=['OPTIONS'])
-@app.route('/start', methods=['OPTIONS'])
-def handle_preflight():
-    return add_cors_headers(make_response("", 200))
 
 
 @app.route("/", methods=["GET"])
@@ -38,8 +30,15 @@ def root():
     return "Backend is running", 200
 
 
-@app.route("/setup", methods=["POST"])
+# -------------------------------
+# HANDLE /setup WITH OPTIONS + POST
+# -------------------------------
+@app.route("/setup", methods=["POST", "OPTIONS"])
 def setup():
+    # Preflight request
+    if request.method == "OPTIONS":
+        return make_response("", 200)
+
     data = request.get_json()
     repo_url = data.get("repo_url")
 
@@ -60,8 +59,14 @@ def setup():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/start", methods=["POST"])
+# -------------------------------
+# HANDLE /start WITH OPTIONS + POST
+# -------------------------------
+@app.route("/start", methods=["POST", "OPTIONS"])
 def start():
+    if request.method == "OPTIONS":
+        return make_response("", 200)
+
     data = request.get_json()
     project_id = data.get("project_id")
 
@@ -77,8 +82,14 @@ def start():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/status/<project_id>", methods=["GET"])
+# -------------------------------
+# HANDLE /status WITH OPTIONS + GET
+# -------------------------------
+@app.route("/status/<project_id>", methods=["GET", "OPTIONS"])
 def status(project_id):
+    if request.method == "OPTIONS":
+        return make_response("", 200)
+
     project_dir = os.path.join(PROJECTS_DIR, project_id)
 
     try:
