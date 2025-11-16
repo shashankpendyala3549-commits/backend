@@ -1,499 +1,920 @@
+import hashlib
+import json
 import os
 import re
-import json
-import subprocess
+import socket
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple, Any
+from typing import Any, Dict, List, Optional, Tuple
 
-# Optional: LLM support (safe import)
+import requests
+
 try:
     from openai import OpenAI  # type: ignore
 except Exception:  # pragma: no cover
     OpenAI = None  # type: ignore
 
 
-IGNORED_DIRS = {
-    ".git",
-    ".github",
-    "node_modules",
-    ".venv",
-    "venv",
-    "__pycache__",
-    "dist",
-    "build",
-    ".idea",
-    ".vscode",
+# -----------------------------------------------------------------------------
+# Paths / storage
+# -----------------------------------------------------------------------------
+BASE_DIR = "offershield_workspace"
+WORKSPACE_DIR = Path(BASE_DIR)
+WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
+
+SCAM_REPORTS_FILE = WORKSPACE_DIR / "scam_reports.json"
+
+
+# -----------------------------------------------------------------------------
+# Static data: HR signatures, salary ranges, risky phrases, etc.
+# -----------------------------------------------------------------------------
+OFFICIAL_HR_EMAILS: Dict[str, List[str]] = {
+    # All lowercase for matching
+    "google": ["no-reply@google.com", "careers@google.com"],
+    "amazon": ["no-reply@amazon.com", "campus-hire@amazon.com"],
+    "microsoft": ["microsoft@e-mail.microsoft.com", "msrecruit@microsoft.com"],
+    "accenture": ["careers@accenture.com", "recruitment@accenture.com"],
+    "deloitte": ["recruiting@deloitte.com", "campusrecruiting@deloitte.com"],
+    "infosys": ["hr@infosys.com", "recruitment@infosys.com"],
+    "tcs": ["hr@tcs.com", "recruitment@tcs.com"],
+    "jpmorgan": ["recruiting@jpmorgan.com"],
+    "meta": ["no-reply@fb.com", "recruiting@fb.com"],
+}
+
+FREE_EMAIL_DOMAINS = {
+    "gmail.com",
+    "yahoo.com",
+    "outlook.com",
+    "hotmail.com",
+    "rediffmail.com",
+    "proton.me",
+    "icloud.com",
+}
+
+RISKY_LANGUAGE_PATTERNS = [
+    r"processing fee",
+    r"registration fee",
+    r"registration amount",
+    r"training fee",
+    r"refundable fee",
+    r"urgent payment",
+    r"pay.*before joining",
+    r"no interview required",
+    r"without any interview",
+    r"confirm within 24 hours",
+    r"confirm in 24 hours",
+    r"do not share this offer",
+    r"don[’']t share this offer",
+    r"whatsapp .* joining",
+    r"whatsapp only for communication",
+    r"certificate fee",
+    r"security deposit",
+    r"slot will be given to next candidate",
+]
+
+WHATSAPP_TELEGRAM_PATTERNS = [
+    r"whatsapp",
+    r"wa\.me/",
+    r"\+?\d{10,13}.*whatsapp",
+    r"telegram",
+    r"t\.me/",
+    r"signal",
+]
+
+SUSPICIOUS_LINK_TLDS = {
+    ".xyz",
+    ".top",
+    ".info",
+    ".pw",
+    ".click",
+    ".club",
+    ".icu",
+}
+
+URL_SHORTENERS = {
+    "bit.ly",
+    "tinyurl.com",
+    "is.gd",
+    "t.co",
+    "cutt.ly",
+    "rb.gy",
+}
+
+SALARY_BENCHMARKS = {
+    # Very rough, just for hackathon demo
+    "india_fresher_software_engineer_month": (20000, 90000),
+    "india_fresher_data_analyst_month": (20000, 80000),
+    "india_intern_month": (0, 35000),
+    "us_fresher_software_engineer_year": (60000, 200000),
+    "us_intern_month": (2000, 10000),
 }
 
 
-def run_cmd(cmd: List[str], cwd: Path) -> Tuple[int, str, str]:
+SECTION_KEYWORDS = {
+    "offer_id": ["offer id", "reference no", "ref no"],
+    "address": ["registered office", "corporate office", "address"],
+    "joining_date": ["date of joining", "doj", "joining date"],
+    "manager": ["reporting manager", "reports to", "supervisor"],
+    "role": ["designation", "position", "job title", "role"],
+    "ctc": ["ctc", "compensation", "salary structure", "remuneration"],
+    "tnc": ["terms and conditions", "terms & conditions", "termination", "bond period"],
+    "contact": ["hr contact", "contact number", "reach out to", "email us at"],
+    "company_ids": ["gst", "pan", "cin"],
+}
+
+
+# -----------------------------------------------------------------------------
+# Utility: Offer hash (used for scam aggregation)
+# -----------------------------------------------------------------------------
+def compute_offer_hash(raw_text: str) -> str:
+    normalized = " ".join(raw_text.split()).strip().lower()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+# -----------------------------------------------------------------------------
+# Scam reports storage (simple JSON file)
+# -----------------------------------------------------------------------------
+def _load_scam_reports() -> Dict[str, int]:
+    if not SCAM_REPORTS_FILE.exists():
+        return {}
     try:
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(cwd),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        out, err = proc.communicate(timeout=60)
-        return proc.returncode, out, err
-    except Exception as e:
-        return 1, "", str(e)
-
-
-def clone_repo(repo_url: str, project_dir: Path) -> None:
-    """Shallow clone the repo into project_dir (if not already cloned)."""
-    if (project_dir / ".git").exists():
-        return
-    code, out, err = run_cmd(["git", "clone", "--depth", "1", repo_url, "."], project_dir)
-    if code != 0:
-        raise RuntimeError(f"Failed to clone repo: {err or out}")
-
-
-def detect_languages(project_dir: Path) -> List[str]:
-    exts_map = {
-        ".js": "JavaScript",
-        ".jsx": "JavaScript",
-        ".ts": "TypeScript",
-        ".tsx": "TypeScript",
-        ".py": "Python",
-        ".java": "Java",
-        ".go": "Go",
-        ".php": "PHP",
-        ".rb": "Ruby",
-        ".rs": "Rust",
-        ".cs": "C#",
-        ".cpp": "C++",
-        ".c": "C",
-    }
-    langs = set()
-    for root, dirs, files in os.walk(project_dir):
-        dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
-        for f in files:
-            ext = Path(f).suffix.lower()
-            if ext in exts_map:
-                langs.add(exts_map[ext])
-    return sorted(langs)
-
-
-def detect_manifests_and_deps(project_dir: Path) -> Tuple[List[str], List[str]]:
-    manifests: List[str] = []
-    deps: List[str] = []
-
-    def add_from_file(file_path: Path):
-        try:
-            text = file_path.read_text(encoding="utf-8", errors="ignore")
-        except Exception:
-            return
-        rel = str(file_path.relative_to(project_dir))
-        manifests.append(rel)
-
-        name = file_path.name.lower()
-        if name == "package.json":
-            try:
-                data = json.loads(text)
-                for section in ("dependencies", "devDependencies"):
-                    for k, v in (data.get(section) or {}).items():
-                        deps.append(f"{k}@{v}")
-            except Exception:
-                pass
-        elif name in ("requirements.txt", "requirements-dev.txt"):
-            for line in text.splitlines():
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                deps.append(line)
-        elif name in ("pyproject.toml", "poetry.lock", "pipfile", "pipfile.lock"):
-            deps.append(f"(see {rel} for Python dependencies)")
-        elif name in ("go.mod", "go.sum"):
-            for line in text.splitlines():
-                if line.strip().startswith("require "):
-                    deps.append(line.strip())
-        elif name in ("pom.xml", "build.gradle", "build.gradle.kts"):
-            deps.append(f"(Java build file: {rel})")
-        elif name == "composer.json":
-            deps.append(f"(PHP composer manifest: {rel})")
-        elif name in ("cargo.toml", "cargo.lock"):
-            deps.append(f"(Rust Cargo manifest: {rel})")
-
-    for root, dirs, files in os.walk(project_dir):
-        dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
-        for f in files:
-            if f.lower() in {
-                "package.json",
-                "requirements.txt",
-                "requirements-dev.txt",
-                "pyproject.toml",
-                "poetry.lock",
-                "pipfile",
-                "pipfile.lock",
-                "go.mod",
-                "go.sum",
-                "pom.xml",
-                "build.gradle",
-                "build.gradle.kts",
-                "composer.json",
-                "cargo.toml",
-                "cargo.lock",
-            }:
-                add_from_file(Path(root) / f)
-
-    seen = set()
-    unique_deps: List[str] = []
-    for d in deps:
-        if d not in seen:
-            seen.add(d)
-            unique_deps.append(d)
-
-    return manifests, unique_deps
-
-
-def detect_env_files(project_dir: Path) -> Tuple[List[str], List[str]]:
-    env_files: List[str] = []
-    env_keys = set()
-
-    patterns = [
-        ".env",
-        ".env.example",
-        ".env.local",
-        "appsettings.json",
-        "appsettings.Development.json",
-        "config.py",
-        "config.js",
-        "config.ts",
-        "settings.py",
-    ]
-
-    for root, dirs, files in os.walk(project_dir):
-        dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
-        for f in files:
-            if f in patterns or f.lower().startswith(".env"):
-                p = Path(root) / f
-                rel = str(p.relative_to(project_dir))
-                env_files.append(rel)
-                try:
-                    text = p.read_text(encoding="utf-8", errors="ignore")
-                except Exception:
-                    continue
-
-                if f.startswith(".env"):
-                    for line in text.splitlines():
-                        line = line.strip()
-                        if not line or line.startswith("#") or "=" not in line:
-                            continue
-                        key = line.split("=", 1)[0].strip()
-                        if key:
-                            env_keys.add(key)
-                elif f.endswith(".json"):
-                    try:
-                        data = json.loads(text)
-                        for k in data.keys():
-                            env_keys.add(k)
-                    except Exception:
-                        pass
-                elif f.endswith(".py"):
-                    for match in re.finditer(r"os\\.environ\\[['\\\"](.*?)['\\\"]\\]", text):
-                        env_keys.add(match.group(1))
-
-    return sorted(env_files), sorted(env_keys)
-
-
-def build_directory_tree(project_dir: Path, max_depth: int = 3, max_entries: int = 60) -> str:
-    lines: List[str] = []
-    count = 0
-
-    def walk(path: Path, prefix: str, depth: int):
-        nonlocal count
-        if depth > max_depth or count >= max_entries:
-            return
-        try:
-            entries = sorted(path.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
-        except Exception:
-            return
-        for i, entry in enumerate(entries):
-            if entry.name in IGNORED_DIRS:
-                continue
-            is_last = i == len(entries) - 1
-            connector = "└── " if is_last else "├── "
-            lines.append(prefix + connector + entry.name)
-            count += 1
-            if count >= max_entries:
-                lines.append(prefix + "└── ...")
-                return
-            if entry.is_dir():
-                extension = "    " if is_last else "│   "
-                walk(entry, prefix + extension, depth + 1)
-
-    lines.append(project_dir.name + "/")
-    walk(project_dir, "", 1)
-    return "\n".join(lines)
-
-
-def detect_run_and_build_commands(project_dir: Path) -> Dict[str, List[str]]:
-    cmds: Dict[str, List[str]] = {
-        "install": [],
-        "build": [],
-        "run": [],
-        "test": [],
-    }
-
-    try:
-        root_files = {p.name.lower() for p in project_dir.iterdir()}
+        data = json.loads(SCAM_REPORTS_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return {str(k): int(v) for k, v in data.items()}
+        return {}
     except Exception:
-        root_files = set()
-
-    # Node / JS / TS
-    if "package.json" in root_files:
-        cmds["install"].append("npm install  # or: pnpm install / yarn")
-        cmds["run"].append("npm start  # or: npm run dev")
-        cmds["build"].append("npm run build")
-        cmds["test"].append("npm test  # if defined in package.json")
-
-    # Python
-    if "requirements.txt" in root_files or "pyproject.toml" in root_files:
-        cmds["install"].append(
-            "python -m venv .venv && source .venv/bin/activate  "
-            "# Windows: .venv\\Scripts\\activate"
-        )
-        if "requirements.txt" in root_files:
-            cmds["install"].append("pip install -r requirements.txt")
-        else:
-            cmds["install"].append("pip install -e .")
-
-        main_candidates = list(project_dir.glob("**/main.py"))
-        if main_candidates:
-            rel = main_candidates[0].relative_to(project_dir)
-            cmds["run"].append(f"python {rel}")
-        cmds["test"].append("pytest  # or: python -m pytest / unittest")
-
-    # Go
-    if "go.mod" in root_files:
-        cmds["install"].append("go mod tidy")
-        cmds["build"].append("go build ./...")
-        cmds["run"].append("go run ./...")
-        cmds["test"].append("go test ./...")
-
-    # Java / Maven / Gradle
-    if "pom.xml" in root_files:
-        cmds["install"].append("mvn clean install")
-        cmds["build"].append("mvn package")
-        cmds["test"].append("mvn test")
-    if "build.gradle" in root_files or "build.gradle.kts" in root_files:
-        cmds["install"].append("./gradlew build  # Windows: gradlew.bat build")
-        cmds["build"].append("./gradlew assemble")
-        cmds["test"].append("./gradlew test")
-
-    # PHP
-    if "composer.json" in root_files:
-        cmds["install"].append("composer install")
-        cmds["test"].append("composer test  # if defined in composer.json")
-
-    # Rust
-    if "cargo.toml" in root_files:
-        cmds["install"].append("cargo fetch")
-        cmds["build"].append("cargo build")
-        cmds["run"].append("cargo run")
-        cmds["test"].append("cargo test")
-
-    # Generic fallbacks
-    if not cmds["install"]:
-        cmds["install"].append("Follow README.md for install instructions.")
-    if not cmds["run"]:
-        cmds["run"].append("Follow README.md for run/start command.")
-    if not cmds["test"]:
-        cmds["test"].append("No explicit test command detected.")
-
-    return cmds
+        return {}
 
 
-def maybe_use_llm(section_name: str, prompt: str, fallback: str) -> str:
+def _save_scam_reports(data: Dict[str, int]) -> None:
+    try:
+        SCAM_REPORTS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception:
+        # Safe fail; nothing critical
+        pass
+
+
+def record_scam_report(offer_hash: str) -> Dict[str, Any]:
+    data = _load_scam_reports()
+    data[offer_hash] = data.get(offer_hash, 0) + 1
+    _save_scam_reports(data)
+    return get_scam_report_stats(offer_hash)
+
+
+def get_scam_report_stats(offer_hash: str) -> Dict[str, Any]:
+    data = _load_scam_reports()
+    count = data.get(offer_hash, 0)
+    return {
+        "reports_count": count,
+        "status": "reported_scam" if count > 0 else "not_reported",
+    }
+
+
+# -----------------------------------------------------------------------------
+# OpenAI helper
+# -----------------------------------------------------------------------------
+def _call_llm(user_prompt: str, max_tokens: int = 400) -> str:
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key or OpenAI is None:
-        return fallback
+        return ""
+
     try:
         client = OpenAI(api_key=api_key)
-        completion = client.responses.create(
-            model="gpt-4.1-mini",
-            input=prompt,
-            max_output_tokens=400,
+        completion = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are OfferShield, an AI that evaluates job offer "
+                        "letters for scam risk, quality, and plausibility. "
+                        "Return clear, concise analysis."
+                    ),
+                },
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=max_tokens,
         )
-        # Responses API: pull first text output
-        for item in completion.output:
-            if hasattr(item, "content"):
-                for part in item.content:
-                    if getattr(part, "type", "") == "output_text":
-                        return getattr(part, "text", fallback)
-        return fallback
+        return (completion.choices[0].message.content or "").strip()
     except Exception:
-        return fallback
+        return ""
 
 
-def build_architecture_overview(
-    project_dir: Path,
-    languages: List[str],
-    manifests: List[str],
-    tree: str,
-) -> str:
-    fallback = (
-        "High-level architecture overview (heuristic):\n"
-        f"- Primary languages: {', '.join(languages) if languages else 'Unknown'}\n"
-        f"- Key manifests: {', '.join(manifests) if manifests else 'None detected'}\n"
-        "- The repository appears to follow a standard project layout. "
-        "See the directory tree above for more detail."
-    )
-    prompt = f"""You are helping a developer onboard to a new codebase.
-
-Repository languages:
-{languages}
-
-Detected manifests / config files:
-{manifests}
-
-Truncated directory tree:
-{tree}
-
-Write a short 'Architecture Overview' (max ~200 words) explaining how the project is structured, what the main components are, and how they likely interact. Aim it at a developer joining the project for the first time. Use bullet points where helpful."""
-    return maybe_use_llm("architecture_overview", prompt, fallback)
+# -----------------------------------------------------------------------------
+# Feature 1: Company Authenticity Scanner
+# -----------------------------------------------------------------------------
+@dataclass
+class CompanyAuthResult:
+    score: int
+    flags: List[str]
+    domain: Optional[str]
+    used_free_email: bool
+    domain_reachable: bool
+    https_ok: bool
 
 
-def build_must_know_section(
-    languages: List[str],
-    env_keys: List[str],
-    run_cmds: Dict[str, List[str]],
-) -> str:
-    fallback = (
-        "Before you start making changes, you should:\n"
-        "- Make sure you can run the project locally using the commands above.\n"
-        "- Understand how configuration and environment variables are managed.\n"
-        "- Identify the main entrypoint files (e.g., app server, CLI, or frontend root).\n"
-        "- Skim the tests to see how behavior is verified."
-    )
-    prompt = f"""Given this project information:
-
-Languages: {languages}
-Env var keys: {env_keys}
-Run & build commands: {run_cmds}
-
-Write a short section titled 'What you must know first' for a new developer. Focus on 4–7 bullet points that they should understand before making any non-trivial change."""
-    return maybe_use_llm("what_you_must_know_first", prompt, fallback)
+def _extract_domain_from_email(email: str) -> Optional[str]:
+    email = (email or "").strip().lower()
+    if "@" not in email:
+        return None
+    return email.split("@", 1)[1]
 
 
-def build_first_issue(project_dir: Path, languages: List[str]) -> str:
-    fallback = (
-        "Suggestion: Pick a small, low-risk improvement, such as:\n"
-        "- Run the project locally and document any missing steps in the README.\n"
-        "- Improve logging or error messages around a common failure path.\n"
-        "- Add or fix a unit test for a core function.\n"
-        "- Clean up obvious TODOs or dead code in a small module."
-    )
-    prompt = f"""You're helping a newcomer pick a 'first issue' in a repository.
+def _check_domain_http(domain: str) -> Tuple[bool, bool]:
+    """Returns (http_ok, https_ok)."""
+    http_ok = False
+    https_ok = False
 
-Languages: {languages}
+    try:
+        # Just resolving DNS gives some signal of existence
+        socket.gethostbyname(domain)
+    except Exception:
+        return False, False
 
-Suggest one concrete, beginner-friendly task that:
-- Is small and achievable in 1–3 hours,
-- Requires reading real code,
-- Adds real value (tests, docs, small refactor, missing validation, etc.).
+    try:
+        r = requests.get(f"http://{domain}", timeout=3)
+        http_ok = r.status_code < 500
+    except Exception:
+        http_ok = False
 
-Write it as a short paragraph plus 3–5 checklist steps."""
-    return maybe_use_llm("first_issue", prompt, fallback)
+    try:
+        r = requests.get(f"https://{domain}", timeout=3, verify=True)
+        https_ok = r.status_code < 500
+    except Exception:
+        https_ok = False
 
-
-def build_steps_to_run_locally(run_cmds: Dict[str, List[str]]) -> str:
-    lines: List[str] = ["Recommended local run workflow:"]
-    if run_cmds["install"]:
-        lines.append("\n1) Install dependencies:")
-        for c in run_cmds["install"]:
-            lines.append(f"   - {c}")
-    if run_cmds["build"]:
-        lines.append("\n2) Build (if needed):")
-        for c in run_cmds["build"]:
-            lines.append(f"   - {c}")
-    if run_cmds["run"]:
-        lines.append("\n3) Run the app:")
-        for c in run_cmds["run"]:
-            lines.append(f"   - {c}")
-    if run_cmds["test"]:
-        lines.append("\n4) Run tests:")
-        for c in run_cmds["test"]:
-            lines.append(f"   - {c}")
-    return "\n".join(lines)
+    return http_ok, https_ok
 
 
-def analyze_project(repo_url: str, project_dir: str) -> Dict[str, Any]:
-    pdir = Path(project_dir)
-    pdir.mkdir(parents=True, exist_ok=True)
+def company_authenticity_check(company_name: str, hr_email: str) -> CompanyAuthResult:
+    flags: List[str] = []
+    score = 100
 
-    # 1) Clone (shallow)
-    clone_repo(repo_url, pdir)
+    company_name_norm = (company_name or "").strip().lower()
+    domain = _extract_domain_from_email(hr_email)
+    used_free_email = False
+    domain_reachable = False
+    https_ok = False
 
-    # 2) Static analysis
-    languages = detect_languages(pdir)
-    manifests, deps = detect_manifests_and_deps(pdir)
-    env_files, env_keys = detect_env_files(pdir)
-    tree = build_directory_tree(pdir)
-    run_cmds = detect_run_and_build_commands(pdir)
-
-    architecture_overview = build_architecture_overview(pdir, languages, manifests, tree)
-    must_know = build_must_know_section(languages, env_keys, run_cmds)
-    first_issue = build_first_issue(pdir, languages)
-    steps_run = build_steps_to_run_locally(run_cmds)
-
-    # Derived legacy-like fields to keep frontend compatible
-    first_task = first_issue.split("\n", 1)[0]
-    guide_parts = [
-        "# What you must know first",
-        must_know,
-        "",
-        "# Steps to run locally",
-        steps_run,
-        "",
-        "# Suggested first issue",
-        first_issue,
-        "",
-        "# Architecture overview",
-        architecture_overview,
-    ]
-    guide = "\n".join(guide_parts)
-
-    return {
-        "project_type": ", ".join(languages) if languages else "Unknown",
-        "languages": languages,
-        "manifests": manifests,
-        "dependencies": deps,
-        "env_files": env_files,
-        "env_variables": env_keys,
-        "directory_tree": tree,
-        "commands": run_cmds,
-        "architecture_overview": architecture_overview,
-        "what_you_must_know_first": must_know,
-        "first_issue": first_issue,
-        "steps_to_run_locally": steps_run,
-        # legacy-style fields used in existing frontend
-        "first_task": first_task,
-        "first_task_guide": guide,
-        "smoke_test": "Run the app locally and ensure the main page loads without errors.",
-    }
-
-
-def setup_repo(repo_url: str, project_dir: str) -> Dict[str, Any]:
-    """Entry point used by the Flask route. Thin wrapper around analyze_project."""
-    return analyze_project(repo_url, project_dir)
-
-
-def start_background_process(project_dir: str) -> Dict[str, Any]:
-    """On free Render tier we don't actually start anything.
-
-    Instead, we tell the frontend to look at 'steps_to_run_locally'.
-    """
-    return {
-        "message": (
-            "Background start is not available on this deployment. "
-            "Use the 'Steps to run locally' section instead."
+    if not domain:
+        flags.append("No valid HR email domain found.")
+        score -= 25
+        return CompanyAuthResult(
+            score=max(score, 0),
+            flags=flags,
+            domain=None,
+            used_free_email=False,
+            domain_reachable=False,
+            https_ok=False,
         )
+
+    if domain in FREE_EMAIL_DOMAINS:
+        used_free_email = True
+        flags.append(f"HR email uses free provider ({domain}).")
+        score -= 35
+
+    official_emails = OFFICIAL_HR_EMAILS.get(company_name_norm, [])
+    if official_emails:
+        # If company is in list, but email doesn't match any known official address
+        if hr_email.strip().lower() not in [e.lower() for e in official_emails]:
+            flags.append(
+                "HR email does not match known official addresses for this company."
+            )
+            score -= 25
+
+    # Domain reachable & SSL
+    http_ok, https_ok = _check_domain_http(domain)
+    domain_reachable = http_ok or https_ok
+
+    if not domain_reachable:
+        flags.append("Company email domain does not appear to be reachable.")
+        score -= 20
+    if http_ok and not https_ok:
+        flags.append("Domain only responds over HTTP (no HTTPS).")
+        score -= 10
+
+    return CompanyAuthResult(
+        score=max(min(score, 100), 0),
+        flags=flags,
+        domain=domain,
+        used_free_email=used_free_email,
+        domain_reachable=domain_reachable,
+        https_ok=https_ok,
+    )
+
+
+# -----------------------------------------------------------------------------
+# Feature 3 & 10: Language risk + WhatsApp/Telegram risk
+# -----------------------------------------------------------------------------
+@dataclass
+class LanguageRiskResult:
+    score: int
+    risk_phrases: List[str]
+    whatsapp_telegram_mentions: List[str]
+
+
+def language_risk_check(raw_text: str) -> LanguageRiskResult:
+    text = raw_text.lower()
+    risk_hits: List[str] = []
+    for pattern in RISKY_LANGUAGE_PATTERNS:
+        if re.search(pattern, text):
+            risk_hits.append(pattern)
+
+    wt_hits: List[str] = []
+    for pattern in WHATSAPP_TELEGRAM_PATTERNS:
+        if re.search(pattern, text):
+            wt_hits.append(pattern)
+
+    # Base: 100 (safe) → down with hits
+    score = 100
+    score -= min(70, 10 * len(risk_hits))
+    score -= min(20, 5 * len(wt_hits))
+
+    return LanguageRiskResult(
+        score=max(score, 0),
+        risk_phrases=risk_hits,
+        whatsapp_telegram_mentions=wt_hits,
+    )
+
+
+# -----------------------------------------------------------------------------
+# Feature 5: Compensation reality check
+# -----------------------------------------------------------------------------
+@dataclass
+class SalaryCheckResult:
+    score: int
+    flags: List[str]
+    parsed_amount: Optional[float]
+
+
+def _parse_salary_amount(raw: Any) -> Optional[float]:
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    s = str(raw)
+    # remove currency symbols and commas
+    s = re.sub(r"[₹$,]", "", s)
+    m = re.search(r"\d+(\.\d+)?", s)
+    if not m:
+        return None
+    try:
+        return float(m.group(0))
+    except Exception:
+        return None
+
+
+def salary_plausibility_check(
+    salary_amount: Any,
+    salary_currency: str,
+    salary_period: str,
+    job_role: str,
+    region_hint: str = "india",
+) -> SalaryCheckResult:
+    amount = _parse_salary_amount(salary_amount)
+    flags: List[str] = []
+    score = 100
+
+    if amount is None:
+        flags.append("Could not parse salary amount; skipping salary realism checks.")
+        return SalaryCheckResult(score=score, flags=flags, parsed_amount=None)
+
+    salary_currency = (salary_currency or "").upper()
+    salary_period = (salary_period or "").lower()
+    role_lower = (job_role or "").lower()
+
+    # Choose key
+    key = None
+    if "intern" in role_lower:
+        key = f"{region_hint}_intern_{salary_period}"
+    elif "data" in role_lower and "analyst" in role_lower:
+        key = f"{region_hint}_fresher_data_analyst_{salary_period}"
+    else:
+        key = f"{region_hint}_fresher_software_engineer_{salary_period}"
+
+    bench = SALARY_BENCHMARKS.get(key)
+    if not bench:
+        flags.append(
+            f"No salary benchmark defined for key '{key}'. Using neutral score."
+        )
+        return SalaryCheckResult(score=score, flags=flags, parsed_amount=amount)
+
+    low, high = bench
+
+    if amount < low * 0.3:
+        flags.append(
+            f"Offered salary ({amount}) is extremely low compared to typical range {low}-{high}."
+        )
+        score -= 30
+    elif amount > high * 2:
+        flags.append(
+            f"Offered salary ({amount}) is extremely high compared to typical range {low}-{high}."
+        )
+        score -= 40
+    elif amount > high * 1.3:
+        flags.append(
+            f"Offered salary ({amount}) is higher than usual; verify with official HR."
+        )
+        score -= 15
+
+    return SalaryCheckResult(score=max(score, 0), flags=flags, parsed_amount=amount)
+
+
+# -----------------------------------------------------------------------------
+# Feature 9: Link validation
+# -----------------------------------------------------------------------------
+@dataclass
+class LinkRiskResult:
+    score: int
+    suspicious_links: List[str]
+    short_links: List[str]
+
+
+def extract_urls(raw_text: str) -> List[str]:
+    pattern = r"(https?://[^\s]+)"
+    return re.findall(pattern, raw_text)
+
+
+def link_risk_check(urls: List[str]) -> LinkRiskResult:
+    suspicious: List[str] = []
+    short: List[str] = []
+    score = 100
+
+    for url in urls:
+        try:
+            host = re.sub(r"^https?://", "", url)
+            host = host.split("/", 1)[0].lower()
+        except Exception:
+            continue
+
+        # Shorteners
+        if any(host.startswith(s) for s in URL_SHORTENERS):
+            short.append(url)
+            score -= 10
+
+        # Suspicious TLDs
+        for tld in SUSPICIOUS_LINK_TLDS:
+            if host.endswith(tld):
+                suspicious.append(url)
+                score -= 15
+                break
+
+        # Look-alike domains (simple)
+        if any(ch in host for ch in ["0", "1", "3", "@"]) and any(
+            name in host for name in ["google", "amazon", "microsoft", "accenture"]
+        ):
+            suspicious.append(url)
+            score -= 20
+
+    return LinkRiskResult(
+        score=max(score, 0),
+        suspicious_links=suspicious,
+        short_links=short,
+    )
+
+
+# -----------------------------------------------------------------------------
+# Feature 11: Interview plausibility
+# -----------------------------------------------------------------------------
+@dataclass
+class InterviewResult:
+    score: int
+    flags: List[str]
+
+
+def interview_plausibility_check(info: Dict[str, Any]) -> InterviewResult:
+    score = 100
+    flags: List[str] = []
+
+    had_interview = bool(info.get("had_interview"))
+    channel = (info.get("channel") or "").lower()
+    duration = info.get("duration_minutes")
+    asked_technical = info.get("asked_technical")
+
+    if not had_interview:
+        flags.append("Candidate reports no interview occurred before offer.")
+        score -= 35
+    else:
+        # Channel heuristics
+        if "whatsapp" in channel or "telegram" in channel:
+            flags.append("Interview was conducted via WhatsApp/Telegram.")
+            score -= 30
+        elif "phone" in channel or "call" in channel:
+            score -= 10
+            flags.append("Interview was only an audio call; verify carefully.")
+
+    if duration is not None:
+        try:
+            d = int(duration)
+            if d < 5:
+                flags.append("Interview duration was less than 5 minutes.")
+                score -= 20
+            elif d < 15:
+                flags.append("Interview duration was very short (< 15 minutes).")
+                score -= 10
+        except Exception:
+            pass
+
+    if asked_technical is False:
+        flags.append("No technical questions were asked for a technical-looking role.")
+        score -= 20
+
+    return InterviewResult(score=max(score, 0), flags=flags)
+
+
+# -----------------------------------------------------------------------------
+# Feature 12: Offer structure validation
+# -----------------------------------------------------------------------------
+@dataclass
+class StructureResult:
+    score: int
+    sections_found: Dict[str, bool]
+    missing_sections: List[str]
+
+
+def structure_validation_check(raw_text: str) -> StructureResult:
+    text = raw_text.lower()
+    sections_found: Dict[str, bool] = {}
+    for key, keywords in SECTION_KEYWORDS.items():
+        present = any(k in text for k in keywords)
+        sections_found[key] = present
+
+    required_keys = [
+        "offer_id",
+        "joining_date",
+        "role",
+        "ctc",
+        "tnc",
+        "contact",
+    ]
+    missing = [k for k in required_keys if not sections_found.get(k)]
+
+    total_required = len(required_keys)
+    present_count = total_required - len(missing)
+    base_score = int((present_count / max(total_required, 1)) * 100)
+
+    # Slightly penalize if company IDs/address missing
+    if not sections_found.get("address"):
+        base_score = max(base_score - 10, 0)
+    if not sections_found.get("company_ids"):
+        base_score = max(base_score - 5, 0)
+
+    return StructureResult(
+        score=base_score,
+        sections_found=sections_found,
+        missing_sections=missing,
+    )
+
+
+# -----------------------------------------------------------------------------
+# Feature 2 + 13: Document integrity + explanation via LLM
+# -----------------------------------------------------------------------------
+@dataclass
+class DocumentIntegrityResult:
+    score: int
+    summary: str
+
+
+def document_integrity_and_explainability(
+    raw_text: str, company_name: str, hr_email: str
+) -> DocumentIntegrityResult:
+    # Let LLM assign a 0–100 document quality score + explanation
+    prompt = f"""
+You are scoring a job offer letter for document integrity and professionalism.
+
+Company: {company_name}
+HR email: {hr_email}
+
+Offer letter text:
+------
+{raw_text}
+------
+
+1. Give a "Document Quality Score" from 0 to 100 (higher is more polished and professional).
+2. Briefly explain 4–8 bullet points about:
+   - formatting clarity
+   - presence/absence of key sections
+   - language quality
+   - any red flags about how the letter looks or reads (NOT about salary or domain).
+3. At the end, write: "SCORE: <number>".
+
+Keep it concise.
+"""
+    llm_output = _call_llm(prompt, max_tokens=350) or ""
+    score = 60  # default
+
+    m = re.search(r"SCORE:\s*(\d+)", llm_output)
+    if m:
+        try:
+            score_val = int(m.group(1))
+            score = max(0, min(100, score_val))
+        except Exception:
+            pass
+
+    return DocumentIntegrityResult(score=score, summary=llm_output.strip())
+
+
+# -----------------------------------------------------------------------------
+# Feature 8: Role consistency validator (LLM)
+# -----------------------------------------------------------------------------
+@dataclass
+class RoleConsistencyResult:
+    score: int
+    summary: str
+
+
+def role_consistency_check(
+    job_role: str, raw_text: str, interview_info: Dict[str, Any]
+) -> RoleConsistencyResult:
+    prompt = f"""
+You are checking if a job offer letter and interview process are plausible for the stated role.
+
+Role: {job_role}
+Interview info (JSON):
+{json.dumps(interview_info, indent=2)}
+
+Offer letter text:
+------
+{raw_text}
+------
+
+1. Give a "Role & Process Plausibility Score" from 0 to 100.
+2. Explain briefly why (3–6 bullet points).
+3. At the end, write: "SCORE: <number>".
+
+Focus on: whether the described process (interview / lack of it), responsibilities, and tone match typical hiring flows for such roles.
+"""
+    llm_output = _call_llm(prompt, max_tokens=350) or ""
+    score = 60
+    m = re.search(r"SCORE:\s*(\d+)", llm_output)
+    if m:
+        try:
+            score_val = int(m.group(1))
+            score = max(0, min(100, score_val))
+        except Exception:
+            pass
+
+    return RoleConsistencyResult(score=score, summary=llm_output.strip())
+
+
+# -----------------------------------------------------------------------------
+# Feature 6: Company existence check (simple)
+# -----------------------------------------------------------------------------
+@dataclass
+class CompanyExistenceResult:
+    score: int
+    flags: List[str]
+    checked_domain: Optional[str]
+
+
+def company_existence_check(company_name: str, hr_email: str) -> CompanyExistenceResult:
+    flags: List[str] = []
+    score = 100
+    domain = _extract_domain_from_email(hr_email)
+
+    if not domain:
+        flags.append("No domain available to check company existence.")
+        score -= 20
+        return CompanyExistenceResult(
+            score=max(score, 0), flags=flags, checked_domain=None
+        )
+
+    http_ok, https_ok = _check_domain_http(domain)
+    if not (http_ok or https_ok):
+        flags.append("Company domain did not respond over HTTP/HTTPS.")
+        score -= 30
+
+    return CompanyExistenceResult(
+        score=max(score, 0),
+        flags=flags,
+        checked_domain=domain,
+    )
+
+
+# -----------------------------------------------------------------------------
+# Explanation aggregator (Feature 13) + Final trust score (Feature 15)
+# -----------------------------------------------------------------------------
+def aggregate_final_score(
+    company_auth: CompanyAuthResult,
+    lang_risk: LanguageRiskResult,
+    salary_check: SalaryCheckResult,
+    link_risk: LinkRiskResult,
+    interview_res: InterviewResult,
+    structure_res: StructureResult,
+    doc_integrity: DocumentIntegrityResult,
+    role_consistency: RoleConsistencyResult,
+    company_exist: CompanyExistenceResult,
+    scam_reports: Dict[str, Any],
+) -> Dict[str, Any]:
+    # Convert risk-oriented scores to "trust" scores in 0–100
+    trust_company = company_auth.score
+    trust_language = lang_risk.score
+    trust_salary = salary_check.score
+    trust_links = link_risk.score
+    trust_interview = interview_res.score
+    trust_structure = structure_res.score
+    trust_document = doc_integrity.score
+    trust_role = role_consistency.score
+    trust_company_exist = company_exist.score
+
+    # Past scam reports: each report knocks trust
+    reports_count = scam_reports.get("reports_count", 0)
+    trust_scam = max(0, 100 - reports_count * 15)
+
+    # Weighted average
+    weights = {
+        "company": 0.2,
+        "language": 0.15,
+        "salary": 0.1,
+        "links": 0.05,
+        "interview": 0.1,
+        "structure": 0.1,
+        "document": 0.1,
+        "role": 0.1,
+        "company_exist": 0.05,
+        "scam": 0.05,
+    }
+
+    final_score = (
+        trust_company * weights["company"]
+        + trust_language * weights["language"]
+        + trust_salary * weights["salary"]
+        + trust_links * weights["links"]
+        + trust_interview * weights["interview"]
+        + trust_structure * weights["structure"]
+        + trust_document * weights["document"]
+        + trust_role * weights["role"]
+        + trust_company_exist * weights["company_exist"]
+        + trust_scam * weights["scam"]
+    )
+
+    final_score = int(round(final_score))
+
+    if final_score >= 80:
+        verdict = "Likely Genuine"
+        color = "green"
+    elif final_score >= 60:
+        verdict = "Needs Verification"
+        color = "yellow"
+    else:
+        verdict = "High Scam Risk"
+        color = "red"
+
+    # Explainability: collect reasons
+    reasons: List[str] = []
+
+    # Company auth reasons
+    reasons.extend(company_auth.flags)
+    reasons.extend(company_exist.flags)
+    reasons.extend(salary_check.flags)
+    reasons.extend(interview_res.flags)
+
+    if lang_risk.risk_phrases:
+        reasons.append(
+            f"High-risk language patterns detected: {', '.join(lang_risk.risk_phrases)}"
+        )
+    if lang_risk.whatsapp_telegram_mentions:
+        reasons.append(
+            "Mentions of WhatsApp/Telegram/Signal in the offer text, which is unusual for formal offers."
+        )
+    if link_risk.suspicious_links:
+        reasons.append(
+            f"Suspicious links found: {', '.join(link_risk.suspicious_links)}"
+        )
+    if reports_count > 0:
+        reasons.append(
+            f"This letter hash has been reported as scam {reports_count} time(s) by other users."
+        )
+    if structure_res.missing_sections:
+        reasons.append(
+            f"Missing important sections: {', '.join(structure_res.missing_sections)}"
+        )
+
+    return {
+        "score": final_score,
+        "verdict": verdict,
+        "verdict_color": color,
+        "reasons": reasons[:12],  # cap for UI
     }
 
 
-def get_status(project_dir: str) -> Dict[str, Any]:
-    # Minimal stub – in future you could track a status.json in project_dir
-    return {"status": "not-tracked"}
+# -----------------------------------------------------------------------------
+# MAIN ENTRY: verify_offer (used by Flask)
+# -----------------------------------------------------------------------------
+def verify_offer(payload: Dict[str, Any]) -> Dict[str, Any]:
+    company_name = payload.get("company_name", "")
+    hr_email = payload.get("hr_email", "")
+    raw_text = payload.get("raw_text", "") or payload.get("offer_text", "")
+    raw_text = str(raw_text)
+
+    salary_amount = payload.get("salary_amount")
+    salary_currency = payload.get("salary_currency", "INR")
+    salary_period = payload.get("salary_period", "month")
+    job_role = payload.get("job_role", "")
+    region_hint = payload.get("region_hint", "india")
+
+    interview_info = payload.get("interview") or {}
+    urls = payload.get("links") or extract_urls(raw_text)
+
+    # 1) Company authenticity
+    company_auth = company_authenticity_check(company_name, hr_email)
+
+    # 2 & 13) Document integrity + explanation
+    doc_integrity = document_integrity_and_explainability(
+        raw_text, company_name, hr_email
+    )
+
+    # 3 & 10) Language risk + WhatsApp / Telegram
+    lang_risk = language_risk_check(raw_text)
+
+    # 5) Compensation plausibility
+    salary_check = salary_plausibility_check(
+        salary_amount,
+        salary_currency,
+        salary_period,
+        job_role,
+        region_hint=region_hint,
+    )
+
+    # 6) Company existence
+    company_exist = company_existence_check(company_name, hr_email)
+
+    # 8) Role consistency
+    role_consistency = role_consistency_check(job_role, raw_text, interview_info)
+
+    # 9) Link validation
+    link_risk = link_risk_check(urls)
+
+    # 11) Interview plausibility
+    interview_res = interview_plausibility_check(interview_info)
+
+    # 12) Offer structure validation
+    structure_res = structure_validation_check(raw_text)
+
+    # Past scam reports will be injected by Flask (we only use placeholder here)
+    # (Flask passes real stats separately into aggregate_final_score)
+    dummy_scam_stats = {"reports_count": 0}
+
+    # Aggregate final trust score (without real scam stats yet)
+    final = aggregate_final_score(
+        company_auth=company_auth,
+        lang_risk=lang_risk,
+        salary_check=salary_check,
+        link_risk=link_risk,
+        interview_res=interview_res,
+        structure_res=structure_res,
+        doc_integrity=doc_integrity,
+        role_consistency=role_consistency,
+        company_exist=company_exist,
+        scam_reports=dummy_scam_stats,
+    )
+
+    # Full analysis payload (frontend can show detailed breakdown)
+    return {
+        "company_authenticity": {
+            "score": company_auth.score,
+            "domain": company_auth.domain,
+            "used_free_email": company_auth.used_free_email,
+            "domain_reachable": company_auth.domain_reachable,
+            "https_ok": company_auth.https_ok,
+            "flags": company_auth.flags,
+        },
+        "document_integrity": {
+            "score": doc_integrity.score,
+            "summary": doc_integrity.summary,
+        },
+        "language_risk": {
+            "score": lang_risk.score,
+            "risk_phrases": lang_risk.risk_phrases,
+            "whatsapp_telegram_mentions": lang_risk.whatsapp_telegram_mentions,
+        },
+        "salary_plausibility": {
+            "score": salary_check.score,
+            "parsed_amount": salary_check.parsed_amount,
+            "flags": salary_check.flags,
+        },
+        "company_existence": {
+            "score": company_exist.score,
+            "checked_domain": company_exist.checked_domain,
+            "flags": company_exist.flags,
+        },
+        "link_risk": {
+            "score": link_risk.score,
+            "suspicious_links": link_risk.suspicious_links,
+            "short_links": link_risk.short_links,
+        },
+        "interview_plausibility": {
+            "score": interview_res.score,
+            "flags": interview_res.flags,
+        },
+        "offer_structure": {
+            "score": structure_res.score,
+            "sections_found": structure_res.sections_found,
+            "missing_sections": structure_res.missing_sections,
+        },
+        "role_consistency": {
+            "score": role_consistency.score,
+            "summary": role_consistency.summary,
+        },
+        "final_trust": final,
+    }
